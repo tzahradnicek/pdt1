@@ -23,38 +23,36 @@ def clearFields(elem):
     if '\r' in elem:
         elem = elem.replace('\r', '')
     if elem == '':
-        elem = 'NULL'
+        elem = None
 
     return elem
 
 
-def doCopyFrom(rex, cursor, conn, table):
+def doCopyFrom(cursor, conn, table, rex=None):
     f = open(f'C:\\Users\\tzahr\\Documents\\{table}.csv', 'r', encoding='utf-8')
-    cursor.copy_from(f, table, sep=';')
+    if table not in ['authors', 'conversations']:
+        if table == 'hashtags':
+            cursor.copy_from(f, table, sep=';', columns=['tag'])
+        elif table == 'annotations':
+            cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'value', 'type', 'probability'))
+        elif table == 'links':
+            cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'url', 'title', 'description'))
+    else:
+        cursor.copy_from(f, table, sep=';')
     conn.commit()
-    rex += 1
-    num = 1
     f.close()
-    return rex, 1
+    if rex:
+        rex += 1
+        return rex, 1
 
 
-def copyConv(rex, cursor, conn):
-    f = open('C:\\Users\\tzahr\\Documents\\conv.csv', 'r', encoding='utf-8')
-    cursor.copy_from(f, 'conversations', sep=';')
-    conn.commit()
-    rex += 1
-    num = 1
-    f.close()
-    return rex, 1
-
-
-def removeDupes(table, cursor, conn):
+def removeDupes(table, cursor, conn, column='id'):
     cursor.execute(f"""DELETE FROM {table} a USING (
-              SELECT MIN(ctid) as ctid, id
+              SELECT MIN(ctid) as ctid, {column}
                 FROM {table} 
-                GROUP BY id HAVING COUNT(*) > 1
+                GROUP BY {column} HAVING COUNT(*) > 1
               ) b
-              WHERE a.id = b.id 
+              WHERE a.{column} = b.{column} 
               AND a.ctid <> b.ctid""")
     conn.commit()
 
@@ -62,6 +60,19 @@ def removeDupes(table, cursor, conn):
 def timer(seconds):
     min, sec = divmod(seconds, 60)
     return str(int(min))+':'+str(int(sec))
+
+
+def writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWriter):
+    if annotations:
+        for annot in annotations:
+            annotWriter.writerow(annot)
+    if hashtags:
+        for hasht in hashtags:
+            hashWriter.writerow(hasht)
+    if links:
+        for link in links:
+            linkWriter.writerow(link)
+
 
 def importAuthors(start):
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - start))
@@ -81,8 +92,6 @@ def importAuthors(start):
         rex = 1
         num = 1
         for line in json_file:
-            # if rex == 11:
-            #     break
             if num == 1:
                 blocktime = timeit.default_timer()
                 f = open('C:\\Users\\tzahr\\Documents\\authors.csv', 'w', newline='', encoding='utf-8')
@@ -98,18 +107,18 @@ def importAuthors(start):
             row.clear()
             if num == 100000:
                 f.close()
-                rex, num = doCopyFrom(rex, cursor, conn, 'authors')
+                rex, num = doCopyFrom(cursor, conn, 'authors', rex=rex)
                 print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
                 continue
             num += 1
 
         f.close()
-        rex, num = doCopyFrom(rex, cursor, conn, 'authors')
+        rex, num = doCopyFrom(cursor, conn, 'authors', rex=rex)
         print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
 
     blocktime = timeit.default_timer()
     removeDupes('authors', cursor, conn)
-    print('Cleaning up')
+    print('Cleaning up authors')
     cursor.execute("""ALTER TABLE authors
         ADD PRIMARY KEY (id),
         ALTER COLUMN name SET NOT NULL,
@@ -128,27 +137,65 @@ def importConv():
         rex = 1
         num = 1
         for line in json_file:
+            annotations = None
+            hashtags = None
+            links = None
             if rex == 11:
                 break
             if num == 1:
-                conv = open('C:\\Users\\tzahr\\Documents\\conv.csv', 'w', newline='', encoding='utf-8')
-                writer = csv.writer(conv, delimiter=";")
+                conv = open('C:\\Users\\tzahr\\Documents\\conversations.csv', 'w', newline='', encoding='utf-8')
+                convWriter = csv.writer(conv, delimiter=";")
+                annot = open('C:\\Users\\tzahr\\Documents\\annotations.csv', 'w', newline='', encoding='utf-8')
+                annotWriter = csv.writer(annot, delimiter=";")
+                hash = open('C:\\Users\\tzahr\\Documents\\hashtags.csv', 'w', newline='', encoding='utf-8')
+                hashWriter = csv.writer(hash, delimiter=";")
+                link = open('C:\\Users\\tzahr\\Documents\\links.csv', 'w', newline='', encoding='utf-8')
+                linkWriter = csv.writer(link, delimiter=";")
 
+            #entities -> hashtag url/link, annotations
+            #referenced_tweets -> references
+            #context annotations -> domain/entity
             line = json.loads(line)
-            if line.get('conent'):
-                print('a')
-            row = [line['id'], line['author_id'], 'content placeholder', line['possibly_sensitive'], line['lang'], line['source'],
+            row = [line['id'], line['author_id'], line['text'], line['possibly_sensitive'], line['lang'], line['source'],
                    line['public_metrics']['retweet_count'], line['public_metrics']['reply_count'],
                    line['public_metrics']['like_count'], line['public_metrics']['quote_count'], line['created_at']]
+
+            if line.get('entities'):
+                if line['entities'].get('annotations'):
+                    annotations_list = line['entities']['annotations']
+                    annotations = []
+                    for i in range(0, len(annotations_list)):
+                        annotations.append([line['id'], clearFields(line['entities']['annotations'][i]['normalized_text']),
+                                            clearFields(line['entities']['annotations'][i]['type']), line['entities']['annotations'][i]['probability']])
+                if line['entities'].get('hashtags'):
+                    hashtags_list = line['entities']['hashtags']
+                    hashtags = []
+                    for i in range(0, len(hashtags_list)):
+                        hashtags.append([clearFields(line['entities']['hashtags'][i]['tag'])])
+                if line['entities'].get('urls'):
+                    links_list = line['entities']['urls']
+                    links = []
+                    for i in range(0, len(links_list)):
+                        links.append([line['id'], clearFields(line['entities']['urls'][i]['expanded_url']),
+                                      clearFields(line['entities']['urls'][i]['title']) if line['entities']['urls'][i].get('title') else None,
+                                      clearFields(line['entities']['urls'][i]['description']) if line['entities']['urls'][i].get('description') else None])
+
             for index, elem in enumerate(row):
                 if index in range(2, 4):
                     if index != 3:
                         row[index] = clearFields(elem)
-            writer.writerow(row)
+            writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWriter)
+            convWriter.writerow(row)
             row.clear()
             if num == 100000:
                 conv.close()
-                rex, num = copyConv(rex, cursor, conn)
+                annot.close()
+                hash.close()
+                link.close()
+                rex, num = doCopyFrom(cursor, conn, 'conversations', rex=rex)
+                doCopyFrom(cursor, conn, 'links')
+                doCopyFrom(cursor, conn, 'hashtags')
+                doCopyFrom(cursor, conn, 'annotations')
                 continue
             num += 1
 
@@ -156,19 +203,20 @@ def importConv():
         # rex, num = copyConv(rex, cursor, conn)
 
     removeDupes('conversations', cursor, conn)
+    removeDupes('hashtags', cursor, conn, column='tag')
 
-    cursor.execute("""ALTER TABLE conversations
-    ADD PRIMARY KEY (id),
-    ALTER COLUMN like_count SET NOT NULL,
-    ALTER COLUMN quote_count SET NOT NULL,
-    ALTER COLUMN retweet_count SET NOT NULL,
-    ALTER COLUMN reply_count SET NOT NULL;""")
-    conn.commit()
+    # cursor.execute("""ALTER TABLE conversations
+    # ADD PRIMARY KEY (id),
+    # ALTER COLUMN like_count SET NOT NULL,
+    # ALTER COLUMN quote_count SET NOT NULL,
+    # ALTER COLUMN retweet_count SET NOT NULL,
+    # ALTER COLUMN reply_count SET NOT NULL;""")
+    # conn.commit()
 
 
 start = timeit.default_timer()
-importAuthors(start)
-#importConv()
+#importAuthors(start)
+importConv()
 
 
 stop = timeit.default_timer()
