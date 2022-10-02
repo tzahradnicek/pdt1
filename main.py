@@ -5,11 +5,6 @@ import timeit
 import gzip
 from datetime import datetime
 
-conn = psycopg2.connect(
-    database="postgres", user='postgres', password='postgres', host='localhost', port='5432'
-)
-cursor = conn.cursor()
-
 
 def clearFields(elem):
     if '\x00' in elem:
@@ -28,7 +23,7 @@ def clearFields(elem):
     return elem
 
 
-def doCopyFrom(cursor, conn, table, rex=None):
+def doCopyFrom(table, rex=None):
     f = open(f'C:\\Users\\tzahr\\Documents\\{table}.csv', 'r', encoding='utf-8')
     if table not in ['authors', 'conversations', 'context_domains', 'context_entities']:
         if table == 'hashtags':
@@ -39,10 +34,6 @@ def doCopyFrom(cursor, conn, table, rex=None):
             cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'url', 'title', 'description'))
         elif table == 'conversation_references':
             cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'parent_id', 'type'))
-        # elif table == 'context_domains':
-        #     cursor.copy_from(f, table, sep=';', columns=('name', 'description'))
-        # elif table == 'context_entities':
-        #     cursor.copy_from(f, table, sep=';', columns=('name', 'description'))
     else:
         cursor.copy_from(f, table, sep=';')
     f.close()
@@ -51,7 +42,7 @@ def doCopyFrom(cursor, conn, table, rex=None):
         return rex, 1
 
 
-def removeDupes(table, cursor, conn, column='id'):
+def removeDupes(table, column='id'):
     cursor.execute(f"""DELETE FROM {table} a USING (
               SELECT MIN(ctid) as ctid, {column}
                 FROM {table} 
@@ -60,6 +51,115 @@ def removeDupes(table, cursor, conn, column='id'):
               WHERE a.{column} = b.{column} 
               AND a.ctid <> b.ctid""")
     conn.commit()
+
+
+def createConvTables():
+    cursor.execute("""
+    DROP TABLE IF EXISTS conversation_references;
+    DROP TABLE IF EXISTS conversations;
+    DROP TABLE IF EXISTS annotations;
+    DROP TABLE IF EXISTS links;
+    DROP TABLE IF EXISTS hashtags;
+    DROP TABLE IF EXISTS context_domains;
+    DROP TABLE IF EXISTS context_entities;
+    create table context_entities (
+        id int8,
+        name VARCHAR(255),
+        description text
+    );
+
+    create table context_domains (
+        id int8,
+        name VARCHAR(255),
+        description text
+    );
+
+    create table conversation_references (
+        id bigserial primary key,
+        conversation_id int8,
+        parent_id int8,
+        type varchar(20)
+    );
+
+    create table annotations (
+        id bigserial primary key,
+        conversation_id int8,
+        value text,
+        type text,
+        probability NUMERIC(4,3)
+    );
+
+    create table links (
+        id bigserial primary key,
+        conversation_id int8,
+        url varchar(2048),
+        title text,
+        description text
+    );
+
+
+    create table hashtags (
+        id bigserial primary key,
+        tag text
+    );
+
+    create table conversations (
+        id int8,
+        author_id int8,
+        content TEXT,
+        possibly_sensitive bool,
+        language varchar(3),
+        source text,
+        retweet_count int4,
+        reply_count int4,
+        like_count int4,
+        quote_count int4,
+        created_at TIMESTAMP
+    );
+    """)
+    conn.commit()
+
+
+def cleanConvTables():
+    blocktime = timeit.default_timer()
+    print('Cleaning up conversations + hashtags')
+    removeDupes('conversations')
+    removeDupes('hashtags', column='tag')
+
+    cursor.execute("""ALTER TABLE conversations
+            ADD PRIMARY KEY (id),
+            ALTER COLUMN author_id SET NOT NULL,
+            ALTER COLUMN content SET NOT NULL,
+            ALTER COLUMN possibly_sensitive SET NOT NULL,
+            ALTER COLUMN language SET NOT NULL,
+            ALTER COLUMN source SET NOT NULL,
+            ALTER COLUMN created_at SET NOT NULL;""")
+    conn.commit()
+    print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
+
+    blocktime = timeit.default_timer()
+    print('Linking conversations with authors')
+    cursor.execute("""
+        insert into authors (id)
+            select distinct author_id from conversations conv where conv.author_id not in (
+                select id from authors auth where auth.id = conv.author_id; )
+
+        alter table conversations
+        add foreign key (author_id) REFERENCES authors (id);""")
+    conn.commit()
+    print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
+
+    blocktime = timeit.default_timer()
+    print('Linking conversation_references with conversations')
+    cursor.execute("""
+        delete from conversation_references convref where convref.parent_id in (
+            select distinct parent_id from conversation_references cref where parent_id not in (
+                select id from conversations conv where conv.id = cref.parent_id));
+
+        alter table conversation_references
+        add foreign key (parent_id) REFERENCES conversations (id);""")
+    conn.commit()
+    print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
 
 
 def timer(seconds):
@@ -88,10 +188,12 @@ def writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWrit
             cont_entWriter.writerow(cont)
 
 
-def importAuthors(start):
+def importAuthors():
     print('Starting Authors import')
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - start))
-    cursor.execute("""create table authors (
+    cursor.execute("""
+    drop table if exists authors;
+    create table authors (
         id int8,
         name VARCHAR(255),
         username VARCHAR(255),
@@ -122,19 +224,19 @@ def importAuthors(start):
             row.clear()
             if num == 100000:
                 f.close()
-                rex, num = doCopyFrom(cursor, conn, 'authors', rex=rex)
+                rex, num = doCopyFrom('authors', rex=rex)
                 conn.commit()
                 print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
                 continue
             num += 1
 
         f.close()
-        doCopyFrom(cursor, conn, 'authors', rex=rex)
+        doCopyFrom('authors', rex=rex)
         conn.commit()
         print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
 
     blocktime = timeit.default_timer()
-    removeDupes('authors', cursor, conn)
+    removeDupes('authors')
     print('Cleaning up authors')
     cursor.execute("""ALTER TABLE authors
         ADD PRIMARY KEY (id);""")
@@ -142,7 +244,7 @@ def importAuthors(start):
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
 
 
-def importConv(start):
+def importConv():
     print('Starting Conversations + linked table import')
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - start))
     with gzip.open('C:\\Users\\tzahr\\Downloads\\conversations.jsonl.gz', 'r') as json_file:
@@ -155,7 +257,7 @@ def importConv(start):
             references = None
             context_dom = None
             context_ent = None
-            if rex == 11:
+            if rex == 51:
                 break
             if num == 1:
                 blocktime = timeit.default_timer()
@@ -226,13 +328,13 @@ def importConv(start):
                 ref.close()
                 cont_dom.close()
                 cont_ent.close()
-                rex, num = doCopyFrom(cursor, conn, 'conversations', rex=rex)
-                doCopyFrom(cursor, conn, 'links')
-                doCopyFrom(cursor, conn, 'hashtags')
-                doCopyFrom(cursor, conn, 'annotations')
-                doCopyFrom(cursor, conn, 'conversation_references')
-                doCopyFrom(cursor, conn, 'context_domains')
-                doCopyFrom(cursor, conn, 'context_entities')
+                rex, num = doCopyFrom('conversations', rex=rex)
+                doCopyFrom('links')
+                doCopyFrom('hashtags')
+                doCopyFrom('annotations')
+                doCopyFrom('conversation_references')
+                doCopyFrom('context_domains')
+                doCopyFrom('context_entities')
                 conn.commit()
                 print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
                 continue
@@ -245,30 +347,26 @@ def importConv(start):
         ref.close()
         cont_dom.close()
         cont_ent.close()
-        rex, num = doCopyFrom(cursor, conn, 'conversations', rex=rex)
-        doCopyFrom(cursor, conn, 'links')
-        doCopyFrom(cursor, conn, 'hashtags')
-        doCopyFrom(cursor, conn, 'annotations')
-        doCopyFrom(cursor, conn, 'conversation_references')
-        doCopyFrom(cursor, conn, 'context_domains')
-        doCopyFrom(cursor, conn, 'context_entities')
+        rex, num = doCopyFrom('conversations', rex=rex)
+        doCopyFrom('links')
+        doCopyFrom('hashtags')
+        doCopyFrom('annotations')
+        doCopyFrom('conversation_references')
+        doCopyFrom('context_domains')
+        doCopyFrom('context_entities')
         conn.commit()
         print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
 
-    blocktime = timeit.default_timer()
-    print('Cleaning up conversations + hashtags')
-    removeDupes('conversations', cursor, conn)
-    removeDupes('hashtags', cursor, conn, column='tag')
-    print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
-
-    # cursor.execute("""ALTER TABLE conversations
-    # ADD PRIMARY KEY (id);""")
-    # conn.commit()
+    cleanConvTables()
 
 
+conn = psycopg2.connect(database="postgres", user='postgres', password='postgres', host='localhost', port='5432')
+cursor = conn.cursor()
 start = timeit.default_timer()
-#importAuthors(start)
-importConv(start)
+
+#importAuthors()
+createConvTables()
+importConv()
 
 
 stop = timeit.default_timer()
