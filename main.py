@@ -34,6 +34,10 @@ def doCopyFrom(table, rex=None):
             cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'url', 'title', 'description'))
         elif table == 'conversation_references':
             cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'parent_id', 'type'))
+        elif table == 'context_annotations':
+            cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'context_domain_id', 'context_entity_id'))
+        elif table == 'conversation_hashtags':
+            cursor.copy_from(f, table, sep=';', columns=('conversation_id', 'tag'))
     else:
         cursor.copy_from(f, table, sep=';')
     f.close()
@@ -56,52 +60,67 @@ def removeDupes(table, column='id'):
 def createConvTables():
     cursor.execute("""
     DROP TABLE IF EXISTS conversation_references;
-    DROP TABLE IF EXISTS conversations;
     DROP TABLE IF EXISTS annotations;
     DROP TABLE IF EXISTS links;
-    DROP TABLE IF EXISTS hashtags;
+    DROP TABLE IF EXISTS context_annotations;
     DROP TABLE IF EXISTS context_domains;
     DROP TABLE IF EXISTS context_entities;
+    DROP TABLE IF EXISTS conversation_hashtags;
+    DROP TABLE IF EXISTS conversations;
+    DROP TABLE IF EXISTS hashtags;
     create table context_entities (
         id int8,
-        name VARCHAR(255),
+        name VARCHAR(255) NOT NULL,
         description text
     );
 
     create table context_domains (
         id int8,
-        name VARCHAR(255),
+        name VARCHAR(255) NOT NULL,
         description text
+    );
+    
+    create table context_annotations (
+        id bigserial primary key,
+        conversation_id int8 NOT NULL,
+        context_domain_id int8 NOT NULL,
+        context_entity_id int8 NOT NULL
     );
 
     create table conversation_references (
         id bigserial primary key,
-        conversation_id int8,
-        parent_id int8,
-        type varchar(20)
+        conversation_id int8 NOT NULL,
+        parent_id int8 NOT NULL,
+        type varchar(20) NOT NULL
     );
 
     create table annotations (
         id bigserial primary key,
-        conversation_id int8,
-        value text,
-        type text,
-        probability NUMERIC(4,3)
+        conversation_id int8 NOT NULL,
+        value text NOT NULL,
+        type text NOT NULL,
+        probability NUMERIC(4,3) NOT NULL
     );
 
     create table links (
         id bigserial primary key,
-        conversation_id int8,
-        url varchar(2048),
-        title text,
-        description text
+        conversation_id int8 NOT NULL,
+        url varchar(2048) NOT NULL,
+        title text NOT NULL,
+        description text NOT NULL
     );
-
 
     create table hashtags (
         id bigserial primary key,
-        tag text
+        tag text NOT NULL
     );
+    
+    create table conversation_hashtags (
+        id bigserial primary key,
+        conversation_id int8 NOT NULL,
+        tag text,
+        hashtag_id int8
+    );   
 
     create table conversations (
         id int8,
@@ -122,9 +141,8 @@ def createConvTables():
 
 def cleanConvTables():
     blocktime = timeit.default_timer()
-    print('Cleaning up conversations + hashtags')
+    print('Cleaning up conversations')
     removeDupes('conversations')
-    removeDupes('hashtags', column='tag')
 
     cursor.execute("""ALTER TABLE conversations
             ADD PRIMARY KEY (id),
@@ -142,7 +160,7 @@ def cleanConvTables():
     cursor.execute("""
         insert into authors (id)
             select distinct author_id from conversations conv where conv.author_id not in (
-                select id from authors auth where auth.id = conv.author_id; )
+                select id from authors auth where auth.id = conv.author_id);
 
         alter table conversations
         add foreign key (author_id) REFERENCES authors (id);""")
@@ -161,13 +179,50 @@ def cleanConvTables():
     conn.commit()
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
 
+    blocktime = timeit.default_timer()
+    print('Deduplicating context entities and domains')
+    removeDupes('context_entities')
+    removeDupes('context_domains')
+    cursor.execute("""
+    alter table context_entities
+    add primary key(id);
+    
+    alter table context_domains
+    add primary key(id);
+    
+    alter table context_annotations
+	add foreign key (conversation_id) references conversations(id),
+	add foreign key (context_domain_id) references context_domains(id),
+	add foreign key (context_entity_id) references context_entities(id)
+	""")
+    conn.commit()
+    print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
+
+    blocktime = timeit.default_timer()
+    print('Cleaning up hashtags + conversation_hashtags')
+    removeDupes('hashtags', column='tag')
+    cursor.execute("""
+        update conversation_hashtags
+        set hashtag_id = hashtags.id
+        from hashtags
+        where hashtags.tag = conversation_hashtags.tag;
+        
+        alter table conversation_hashtags
+            add foreign key (hashtag_id) references hashtags(id);
+        
+        alter table conversation_hashtags
+            drop column tag;
+    """)
+    conn.commit()
+    print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
+
 
 def timer(seconds):
     min, sec = divmod(seconds, 60)
     return str(int(min))+':'+str(int(sec))
 
 
-def writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWriter, refs, refWriter, cont_dom, cont_domWriter, cont_ent, cont_entWriter):
+def writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWriter, refs, refWriter, cont_dom, cont_domWriter, cont_ent, cont_entWriter, cont_ann, cont_annWriter, conv_hash, conv_hashWriter):
     if annotations:
         for annot in annotations:
             annotWriter.writerow(annot)
@@ -186,6 +241,12 @@ def writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWrit
     if cont_ent:
         for cont in cont_ent:
             cont_entWriter.writerow(cont)
+    if cont_ann:
+        for cont in cont_ann:
+            cont_annWriter.writerow(cont)
+    if conv_hash:
+        for hasht in conv_hash:
+            conv_hashWriter.writerow(hasht)
 
 
 def importAuthors():
@@ -245,8 +306,10 @@ def importAuthors():
 
 
 def importConv():
-    print('Starting Conversations + linked table import')
+    print('Creating all conv tables')
+    createConvTables()
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - start))
+    print('Starting Conversations + linked table imports')
     with gzip.open('C:\\Users\\tzahr\\Downloads\\conversations.jsonl.gz', 'r') as json_file:
         rex = 1
         num = 1
@@ -257,6 +320,8 @@ def importConv():
             references = None
             context_dom = None
             context_ent = None
+            context_ann = None
+            conversation_hash = None
             if rex == 51:
                 break
             if num == 1:
@@ -275,6 +340,10 @@ def importConv():
                 cont_domWriter = csv.writer(cont_dom, delimiter=";")
                 cont_ent = open('C:\\Users\\tzahr\\Documents\\context_entities.csv', 'w', newline='', encoding='utf-8')
                 cont_entWriter = csv.writer(cont_ent, delimiter=";")
+                cont_ann = open('C:\\Users\\tzahr\\Documents\\context_annotations.csv', 'w', newline='', encoding='utf-8')
+                cont_annWriter = csv.writer(cont_ann, delimiter=";")
+                conv_hash = open('C:\\Users\\tzahr\\Documents\\conversation_hashtags.csv', 'w', newline='', encoding='utf-8')
+                conv_hashWriter = csv.writer(conv_hash, delimiter=";")
 
             line = json.loads(line)
             row = [line['id'], line['author_id'], line['text'], line['possibly_sensitive'], line['lang'], line['source'],
@@ -290,8 +359,10 @@ def importConv():
                 if line['entities'].get('hashtags'):
                     hashtags_list = line['entities']['hashtags']
                     hashtags = []
+                    conversation_hash = []
                     for i in hashtags_list:
                         hashtags.append([clearFields(i['tag'])])
+                        conversation_hash.append([line['id'], clearFields(i['tag'])])
                 if line['entities'].get('urls'):
                     links_list = line['entities']['urls']
                     links = []
@@ -309,15 +380,18 @@ def importConv():
                 context_list = line['context_annotations']
                 context_dom = []
                 context_ent = []
+                context_ann = []
                 for i in context_list:
                     context_dom.append([i['domain']['id'], clearFields(i['domain']['name']), clearFields(i['domain']['description']) if i['domain'].get('description') else None])
-                    context_ent.append([i['domain']['id'], clearFields(i['entity']['name']), clearFields(i['entity']['description']) if i['entity'].get('description') else None])
+                    context_ent.append([i['entity']['id'], clearFields(i['entity']['name']), clearFields(i['entity']['description']) if i['entity'].get('description') else None])
+                    context_ann.append([line['id'], i['domain']['id'], i['entity']['id']])
 
             for index, elem in enumerate(row):
                 if index in range(2, 4):
                     if index != 3:
                         row[index] = clearFields(elem)
-            writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWriter, references, refWriter, context_dom, cont_domWriter, context_ent, cont_entWriter)
+            writeConvCSV(annotations, annotWriter, hashtags, hashWriter, links, linkWriter, references, refWriter, context_dom, cont_domWriter,
+                         context_ent, cont_entWriter, context_ann, cont_annWriter, conversation_hash, conv_hashWriter)
             convWriter.writerow(row)
             row.clear()
             if num == 100000:
@@ -328,6 +402,8 @@ def importConv():
                 ref.close()
                 cont_dom.close()
                 cont_ent.close()
+                cont_ann.close()
+                conv_hash.close()
                 rex, num = doCopyFrom('conversations', rex=rex)
                 doCopyFrom('links')
                 doCopyFrom('hashtags')
@@ -335,6 +411,8 @@ def importConv():
                 doCopyFrom('conversation_references')
                 doCopyFrom('context_domains')
                 doCopyFrom('context_entities')
+                doCopyFrom('context_annotations')
+                doCopyFrom('conversation_hashtags')
                 conn.commit()
                 print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
                 continue
@@ -347,6 +425,8 @@ def importConv():
         ref.close()
         cont_dom.close()
         cont_ent.close()
+        cont_ann.close()
+        conv_hash.close()
         rex, num = doCopyFrom('conversations', rex=rex)
         doCopyFrom('links')
         doCopyFrom('hashtags')
@@ -354,6 +434,8 @@ def importConv():
         doCopyFrom('conversation_references')
         doCopyFrom('context_domains')
         doCopyFrom('context_entities')
+        doCopyFrom('context_annotations')
+        doCopyFrom('conversation_hashtags')
         conn.commit()
         print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
 
@@ -365,8 +447,8 @@ cursor = conn.cursor()
 start = timeit.default_timer()
 
 #importAuthors()
-createConvTables()
 importConv()
+#cleanConvTables()
 
 
 stop = timeit.default_timer()
