@@ -46,6 +46,10 @@ def doCopyFrom(table, rex=None):
         return rex, 1
 
 
+def vacuum(table):
+    cursor.execute(f"""vacuum full {table}""")
+    conn.commit()
+
 def removeDupes(table, column='id'):
     cursor.execute(f"""DELETE FROM {table} a USING (
               SELECT MIN(ctid) as ctid, {column}
@@ -158,7 +162,7 @@ def createTables():
     timeWriter.writerow([datetime.now().isoformat(), timer(timeit.default_timer() - start), timer(timeit.default_timer() - blocktime)])
 
 
-def cleanConvTables():
+def clearConvTables():
     blocktime = timeit.default_timer()
     print('Cleaning up conversations')
     removeDupes('conversations')
@@ -204,14 +208,16 @@ def cleanConvTables():
     blocktime = timeit.default_timer()
     print('Deduplicating context entities and domains')
     removeDupes('context_entities')
+    vacuum('context_entities')
     removeDupes('context_domains')
+    vacuum('context_domains')
     cursor.execute("""
     alter table context_entities
     add primary key(id);
-    
+
     alter table context_domains
     add primary key(id);
-    
+
     alter table context_annotations
 	add foreign key (conversation_id) references conversations(id),
 	add foreign key (context_domain_id) references context_domains(id),
@@ -222,12 +228,20 @@ def cleanConvTables():
     timeWriter.writerow([datetime.now().isoformat(), timer(timeit.default_timer() - start), timer(timeit.default_timer() - blocktime)])
 
     blocktime = timeit.default_timer()
-    print('Cleaning up hashtags + conversation_hashtags')
+    print('Cleaning up hashtags')
     removeDupes('hashtags', column='tag')
+    vacuum('hashtags')
     cursor.execute("""
         alter table hashtags
-        add primary key(id);
-        
+        add primary key(id) 
+        add unique (tag);""")
+    conn.commit()
+    print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
+    timeWriter.writerow( [datetime.now().isoformat(), timer(timeit.default_timer() - start), timer(timeit.default_timer() - blocktime)])
+
+    blocktime = timeit.default_timer()
+    print('Cleaning up conversation_hashtags')
+    cursor.execute("""    
         update conversation_hashtags
         set hashtag_id = hashtags.id
         from hashtags
@@ -455,7 +469,7 @@ def importConv():
         print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
         timeWriter.writerow([datetime.now().isoformat(), timer(timeit.default_timer() - start), timer(timeit.default_timer() - blocktime)])
 
-    cleanConvTables()
+    clearConvTables()
 
 
 conn = psycopg2.connect(database="postgres", user='postgres', password='postgres', host='localhost', port='5432')
@@ -463,9 +477,10 @@ cursor = conn.cursor()
 start = timeit.default_timer()
 timeLog = open('C:\\Users\\tzahr\\Documents\\timelog.csv', 'w', newline='', encoding='utf-8')
 timeWriter = csv.writer(timeLog, delimiter=";")
-createTables()
-importAuthors()
-importConv()
+# createTables()
+# importAuthors()
+# importConv()
+clearConvTables()
 
 stop = timeit.default_timer()
 print('Total time:', timer(stop - start))
