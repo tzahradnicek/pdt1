@@ -233,7 +233,7 @@ def clearConvTables():
     vacuum('hashtags')
     cursor.execute("""
         alter table hashtags
-        add primary key(id) 
+        add primary key(tag),
         add unique (tag);""")
     conn.commit()
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
@@ -241,11 +241,19 @@ def clearConvTables():
 
     blocktime = timeit.default_timer()
     print('Cleaning up conversation_hashtags')
-    cursor.execute("""    
+    cursor.execute("""
         update conversation_hashtags
         set hashtag_id = hashtags.id
         from hashtags
-        where hashtags.tag = conversation_hashtags.tag;
+        where hashtags.tag = conversation_hashtags.tag;""")
+    conn.commit()
+    print('update conv hash done')
+    cursor.execute("""
+        alter table hashtags
+        drop constraint hashtags_pkey;
+        
+        alter table hashtags
+        add primary key (id);
         
         alter table conversation_hashtags
             add foreign key (hashtag_id) references hashtags(id);
@@ -254,7 +262,7 @@ def clearConvTables():
         alter column hashtag_id set not null;
         
         alter table conversation_hashtags
-            drop column tag;
+            drop column tag; 
     """)
     conn.commit()
     print(datetime.now().isoformat() + ';', timer(timeit.default_timer() - start) + ';', timer(timeit.default_timer() - blocktime))
@@ -474,13 +482,13 @@ def importConv():
 
 conn = psycopg2.connect(database="postgres", user='postgres', password='postgres', host='localhost', port='5432')
 cursor = conn.cursor()
+conn.set_isolation_level(0)
 start = timeit.default_timer()
 timeLog = open('C:\\Users\\tzahr\\Documents\\timelog.csv', 'w', newline='', encoding='utf-8')
 timeWriter = csv.writer(timeLog, delimiter=";")
-# createTables()
-# importAuthors()
-# importConv()
-clearConvTables()
+createTables()
+importAuthors()
+importConv()
 
 stop = timeit.default_timer()
 print('Total time:', timer(stop - start))
